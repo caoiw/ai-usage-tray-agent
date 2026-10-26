@@ -281,6 +281,55 @@
                       </div>
                     </div>
                   </div>
+                  <!-- Grava no contas.json pelo set_sessao_auto_codex, à parte do auto-save do config.json. -->
+                  <div class="provider-card" id="set-codexSessaoAutoCard">
+                    <div class="provider-head">
+                      <div class="provider-title">
+                        <div class="provider-name">Abrir a sessão automaticamente</div>
+                        <div class="provider-sub">Envia um “Oi” para abrir a janela de 5h sozinho. Precisa do Codex CLI instalado; o envio usa o login da conta, não o do CLI.</div>
+                      </div>
+                      <label class="switch" title="Abrir a sessão automaticamente">
+                        <input type="checkbox" id="set-codexSessaoAuto">
+                        <span class="switch-track"></span>
+                      </label>
+                    </div>
+                    <div class="provider-body anima-altura" id="set-codexSessaoAutoBody">
+                      <div class="field">
+                        <label id="set-codexSessaoAutoModoLabel">Quando abrir</label>
+                        <div class="segmented" id="set-codexSessaoAutoModo" role="radiogroup" aria-labelledby="set-codexSessaoAutoModoLabel">
+                          <label class="seg-option">
+                            <input type="radio" name="codexSessaoAutoModo" value="automatico">
+                            <span class="seg-btn">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3.2-6.9"/><path d="M21 3v5h-5"/></svg>
+                              <span>Assim que expira</span>
+                            </span>
+                          </label>
+                          <label class="seg-option">
+                            <input type="radio" name="codexSessaoAutoModo" value="agendado">
+                            <span class="seg-btn">
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
+                              <span>Em horários fixos</span>
+                            </span>
+                          </label>
+                        </div>
+                        <div class="desc" id="set-codexSessaoAutoModoDesc"></div>
+                      </div>
+                      <div class="field anima-altura" id="set-codexSessaoAutoHorariosField" hidden>
+                        <label for="set-codexSessaoAutoHora">Horários <span class="req">(hora local, todos os dias)</span></label>
+                        <div class="inline">
+                          <input type="time" id="set-codexSessaoAutoHora" step="60">
+                          <button type="button" class="btn" id="set-codexSessaoAutoAdd">Adicionar</button>
+                        </div>
+                        <div class="horarios" id="set-codexSessaoAutoLista"></div>
+                        <div class="field-warn anima-altura" id="set-codexSessaoAutoWarn" hidden>Adicione ao menos um horário: sem horários, nada é aberto.</div>
+                      </div>
+                      <div class="field">
+                        <label>Contas</label>
+                        <div class="contas" id="set-codexSessaoAutoContas"></div>
+                        <div class="auth-status" id="set-codexSessaoAutoSemContas">Conecte uma conta para escolher onde abrir a sessão.</div>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </div>
 

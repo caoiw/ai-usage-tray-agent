@@ -18,6 +18,7 @@ mod codex_auth;
 mod codex_dashboard;
 mod contas;
 mod http_server;
+mod sessao_auto_codex;
 mod usage_dashboard;
 
 #[cfg(target_os = "windows")]
@@ -364,7 +365,7 @@ impl Default for ClaudeConfig {
 /// assinatura em `~/.claude` — ou seja, consome a mesma cota que o app mede. Uma
 /// chave `ANTHROPIC_API_KEY` no ambiente desviaria a chamada para a API paga (pool
 /// separado, que nao abre janela nenhuma), entao ela e' removida do processo filho.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct SessaoAutoConfig {
     /// Desligado por padrao: a funcao age na conta do usuario e consome cota,
@@ -447,6 +448,11 @@ struct UsageMetric {
     restante_percentual_7d: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reset_em_7d: Option<String>,
+    /// Detalhe das janelas do Codex que a sessao automatica usa para saber se a
+    /// janela de sessao esta' parada (ver `sessao_auto_codex`). So' em memoria: nao
+    /// vai para a UI nem para o Loki.
+    #[serde(skip)]
+    leitura_codex: Option<sessao_auto_codex::LeituraCodex>,
 }
 
 #[derive(Debug, Clone)]
@@ -571,6 +577,8 @@ struct SharedState {
     /// Reabertura automatica da sessao do Claude: cooldown + resultado da ultima
     /// tentativa (exibido na aba Claude das Configuracoes).
     sessao_auto: Mutex<SessaoAutoState>,
+    /// Sessao automatica do Codex, por conta (ver `sessao_auto_codex`).
+    sessao_auto_codex: sessao_auto_codex::Estado,
 }
 
 /// Estado em memoria da reabertura automatica. Nao vai para o disco: e' so' o
@@ -674,20 +682,25 @@ struct OpenAiUsageResponse {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiRateLimit {
+    /// `false` quando algum limite bloqueia o uso agora.
+    allowed: Option<bool>,
+    limit_reached: Option<bool>,
     primary_window: Option<OpenAiWindow>,
     secondary_window: Option<OpenAiWindow>,
 }
 
 /// Uma janela de limite do Codex. A POSICAO (primary/secondary) NAO e' confiavel:
-/// a OpenAI suspendeu temporariamente o limite de sessao (5h) e passou a devolver
-/// so' o semanal (7d) em `primary_window`, com `secondary_window` ausente. Por isso
+/// a OpenAI ja' suspendeu o limite de sessao (5h) por um tempo e devolvia so' o
+/// semanal (7d) em `primary_window`, com `secondary_window` ausente. Por isso
 /// classificamos cada janela pela duracao (`limit_window_seconds`): ~5h -> sessao;
-/// ~7d -> semanal. Assim volta a funcionar sozinho se/quando o 5h retornar.
+/// ~7d -> semanal. Assim funciona com e sem a janela de 5h.
 #[derive(Debug, Deserialize)]
 struct OpenAiWindow {
     used_percent: Option<f64>,
     reset_at: Option<i64>,
     limit_window_seconds: Option<i64>,
+    /// Segundos ate' o reset, calculados pelo servidor no momento da consulta.
+    reset_after_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -776,6 +789,9 @@ pub fn run() {
             claude_login,
             claude_auth_status,
             get_sessao_auto_status,
+            set_conta_sessao_auto,
+            testar_sessao_auto_codex,
+            set_sessao_auto_codex,
             claude_login_cancel,
             claude_login_orgs,
             claude_select_org,
@@ -814,6 +830,7 @@ pub fn run() {
                 force_pending: AtomicBool::new(false),
                 pending_update: Mutex::new(None),
                 sessao_auto: Mutex::new(SessaoAutoState::default()),
+                sessao_auto_codex: sessao_auto_codex::Estado::default(),
             });
 
             app.manage(paths.clone());
@@ -923,6 +940,8 @@ fn settings_value<R: Runtime>(app: &AppHandle<R>, paths: &RuntimePaths) -> Value
         "autostartLabel": autostart_label(),
         "appVersion": app.package_info().version.to_string(),
         "sessaoAutoStatus": sessao_auto_status,
+        // Ajustes gerais da sessao automatica do Codex: moram no `contas.json`.
+        "sessaoAutoCodex": contas::ler_prefs(&paths.config_dir).sessao_auto_codex(),
     });
     value["config"] = serde_json::to_value(&config).unwrap_or(Value::Null);
     value
@@ -972,6 +991,9 @@ fn save_settings(
     config.envio = disk.envio;
     config.uso_atual = disk.uso_atual;
     config.providers.ordem = disk.providers.ordem;
+    // O caminho do CLI do Claude tambem nao e' editado no painel (so' a' mao no
+    // config.json, que e' o que a mensagem de "CLI nao encontrado" pede).
+    config.providers.claude.sessao_auto.caminho_cli = disk.providers.claude.sessao_auto.caminho_cli;
     normalize_config(&mut config);
 
     write_config(paths.inner(), &config)
@@ -2156,6 +2178,8 @@ fn run_collection_cycle<R: Runtime>(
     // manda a mensagem que abre uma nova. Nao bloqueia: a chamada ao CLI vai para
     // uma thread propria (ver `maybe_reopen_claude_session`).
     maybe_reopen_claude_session(paths, shared, &config);
+    // O mesmo para cada conta do Codex com a abertura automatica ligada.
+    sessao_auto_codex::talvez_abrir(paths, shared, &config, &prefs, &alvos);
 
     // Um unico refresh do tray por ciclo (os erros acima usam `record_runtime_error`,
     // que nao refresca, para nao repintar varias vezes).
@@ -2554,22 +2578,85 @@ fn run_claude_session_opener(
         .arg("--strict-mcp-config")
         .current_dir(&workdir)
         .env_remove("ANTHROPIC_API_KEY")
-        .env_remove("ANTHROPIC_AUTH_TOKEN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Sem isso, cada disparo pisca um console preto na frente do usuario.
+        .env_remove("ANTHROPIC_AUTH_TOKEN");
+
+    let resultado = executar_cli(command, "Claude Code CLI");
+
+    // Sempre depois do processo terminar (com sucesso, erro ou morto no timeout):
+    // o transcript ja' foi gravado e nao queremos deixa-lo para tras.
+    cleanup_session_transcripts(&workdir);
+
+    resultado
+}
+
+/// Flag do `CreateProcess` que impede o console preto de piscar a cada processo
+/// filho (CLI da sessao automatica, `where`, `taskkill`).
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Encerra o processo do CLI **e os filhos dele**. No Windows o CLI costuma ser o
+/// shim `.cmd` do npm: o `kill` derrubaria so' o `cmd.exe`, e o `node` do CLI
+/// seguiria vivo — com os pipes de saida abertos (a leitura deles nunca chegaria
+/// ao fim) e, no Codex, com a copia do login em uso.
+fn matar_arvore(child: &mut std::process::Child) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    // Fora do Windows o CLI roda num grupo de processos proprio (ver
+    // `executar_cli`), cujo id e' o pid dele: matar o grupo leva junto o binario
+    // que o shim do npm inicia (o `codex` em Node roda o executavel nativo).
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Executa o `command` de um disparo da sessao automatica, espera ele terminar
+/// (ate' `SESSAO_AUTO_TIMEOUT`) e devolve `Ok(())` se o CLI saiu com sucesso;
+/// senao, o erro com o que ele escreveu (`nome` aparece nas mensagens).
+///
+/// - stdin fechado (o CLI nunca fica esperando digitacao); stdout e stderr sao
+///   capturados para virar o detalhe do erro (ver `erro_do_cli`) — no sucesso a
+///   resposta do modelo e' descartada;
+/// - timeout com kill da arvore de processos, para nao deixar processo pendurado;
+/// - no Windows, sem console piscando na frente do usuario.
+fn executar_cli(mut command: Command, nome: &str) -> Result<(), String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
         command.creation_flags(CREATE_NO_WINDOW);
+    }
+    // Grupo de processos proprio, para o timeout derrubar o CLI e os filhos dele
+    // de uma vez (ver `matar_arvore`).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
 
     let mut child = command.spawn().map_err(|error| {
         format!(
-            "nao foi possivel executar o Claude Code CLI ({}): {error}",
-            exe.display()
+            "nao foi possivel executar o {nome} ({}): {error}",
+            Path::new(command.get_program()).display()
         )
     })?;
 
@@ -2586,16 +2673,15 @@ fn run_claude_session_opener(
             Ok(Some(status)) => break Ok(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    matar_arvore(&mut child);
                     break Err(format!(
-                        "o Claude Code CLI nao respondeu em {}s",
+                        "o {nome} nao respondeu em {}s",
                         SESSAO_AUTO_TIMEOUT.as_secs()
                     ));
                 }
                 thread::sleep(Duration::from_millis(200));
             }
-            Err(error) => break Err(format!("falha ao aguardar o Claude Code CLI ({error})")),
+            Err(error) => break Err(format!("falha ao aguardar o {nome} ({error})")),
         }
     };
 
@@ -2603,10 +2689,6 @@ fn run_claude_session_opener(
     // entao as threads de drenagem sempre chegam ao EOF e o join nao pendura.
     let saida = saida.join().unwrap_or_default();
     let erros = erros.join().unwrap_or_default();
-
-    // Sempre depois do processo terminar (com sucesso, erro ou morto no timeout):
-    // o transcript ja' foi gravado e nao queremos deixa-lo para tras.
-    cleanup_session_transcripts(&workdir);
 
     // No timeout nao ha' status, mas o que o CLI escreveu antes de travar e' a
     // melhor (as vezes a unica) pista do motivo.
@@ -2619,7 +2701,7 @@ fn run_claude_session_opener(
         return Ok(());
     }
     Err(erro_do_cli(
-        &format!("o Claude Code CLI terminou com {status}"),
+        &format!("o {nome} terminou com {status}"),
         &saida,
         &erros,
     ))
@@ -2738,34 +2820,41 @@ fn transcripts_belong_to(dir: &Path, workdir: &Path) -> bool {
 /// conhecidos de instalacao **antes** do PATH: o app costuma subir pelo autostart,
 /// cujo ambiente nem sempre traz o `PATH` completo do shell do usuario.
 fn resolve_claude_cli(config: &SessaoAutoConfig) -> Result<PathBuf, String> {
-    let manual = config.caminho_cli.trim();
+    resolve_cli(
+        "Claude Code CLI",
+        "claude",
+        &config.caminho_cli,
+        claude_cli_candidates(),
+        "Instale-o (npm i -g @anthropic-ai/claude-code), faca login com a sua assinatura e, \
+         se preciso, informe o caminho no config.json (providers.claude.sessaoAuto.caminhoCli).",
+    )
+}
+
+/// Descobre o executavel de um CLI da sessao automatica (`nome` nas mensagens,
+/// `executavel` no PATH): o caminho `manual`, quando preenchido; senao o primeiro
+/// dos `candidatos` (locais conhecidos de instalacao) que existir; senao o PATH.
+/// `ajuda` completa a mensagem de "nao encontrado".
+fn resolve_cli(
+    nome: &str,
+    executavel: &str,
+    manual: &str,
+    candidatos: Vec<PathBuf>,
+    ajuda: &str,
+) -> Result<PathBuf, String> {
+    let manual = manual.trim();
     if !manual.is_empty() {
         let path = PathBuf::from(manual);
         return if path.is_file() {
             Ok(path)
         } else {
-            Err(format!(
-                "caminho do Claude Code CLI nao encontrado: {manual}"
-            ))
+            Err(format!("caminho do {nome} nao encontrado: {manual}"))
         };
     }
-
-    for candidate in claude_cli_candidates() {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-
-    if let Some(found) = claude_cli_from_path() {
-        return Ok(found);
-    }
-
-    Err(
-        "Claude Code CLI nao encontrado. Instale-o (npm i -g @anthropic-ai/claude-code), \
-         faca login com a sua assinatura e, se preciso, informe o caminho no config.json \
-         (providers.claude.sessaoAuto.caminhoCli)."
-            .to_string(),
-    )
+    candidatos
+        .into_iter()
+        .find(|candidato| candidato.is_file())
+        .or_else(|| cli_do_path(executavel))
+        .ok_or_else(|| format!("{nome} nao encontrado. {ajuda}"))
 }
 
 /// Locais padrao de instalacao do CLI, por sistema.
@@ -2799,21 +2888,20 @@ fn claude_cli_candidates() -> Vec<PathBuf> {
     candidates
 }
 
-/// Ultimo recurso: pergunta ao sistema onde esta' o `claude` (`where`/`which`).
-fn claude_cli_from_path() -> Option<PathBuf> {
+/// Ultimo recurso: pergunta ao sistema onde esta' o CLI `nome` (`where`/`which`).
+fn cli_do_path(nome: &str) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let mut locator = {
         let mut command = Command::new("cmd");
-        command.args(["/C", "where", "claude"]);
+        command.args(["/C", "where", nome]);
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
         command
     };
     #[cfg(not(target_os = "windows"))]
     let mut locator = {
         let mut command = Command::new("sh");
-        command.args(["-c", "command -v claude"]);
+        command.args(["-c", &format!("command -v {nome}")]);
         command
     };
 
@@ -2984,11 +3072,11 @@ fn collect_codex_metric(
 
     // Classifica cada janela presente pela DURACAO, nao pela posicao (primary/
     // secondary): a janela com >= 1 dia de duracao e' a semanal (7d, ~604800s);
-    // as demais sao a de sessao (5h, ~18000s). Hoje a OpenAI suspendeu o 5h e so'
-    // devolve o semanal em `primary_window` (sem `secondary_window`) — a
-    // classificacao por duracao acerta esse caso e volta a mostrar o 5h sozinha se
-    // ele retornar. Fallback: sem `limit_window_seconds`, mantem a ordem legada
-    // (1a janela = sessao, 2a = semanal).
+    // as demais sao a de sessao (5h, ~18000s). Quando a OpenAI suspendeu o 5h, ela
+    // devolvia so' o semanal em `primary_window` (sem `secondary_window`) — a
+    // classificacao por duracao acerta esse caso e volta a mostrar o 5h sozinha
+    // quando ele retorna. Fallback: sem `limit_window_seconds`, mantem a ordem
+    // legada (1a janela = sessao, 2a = semanal).
     const WEEKLY_MIN_SECONDS: i64 = 24 * 60 * 60;
     let mut session_window: Option<&OpenAiWindow> = None;
     let mut weekly_window: Option<&OpenAiWindow> = None;
@@ -3020,6 +3108,17 @@ fn collect_codex_metric(
     let weekly_used = weekly_window.and_then(|window| window.used_percent);
     let weekly_reset = weekly_window.and_then(|window| window.reset_at);
 
+    let leitura = sessao_auto_codex::LeituraCodex {
+        sessao: session_window.map(|window| sessao_auto_codex::JanelaCodex {
+            usado: window.used_percent,
+            limite_segundos: window.limit_window_seconds,
+            reset_em_segundos: window.reset_after_seconds,
+            reset_em: window.reset_at,
+        }),
+        semanal_usado: weekly_used,
+        bloqueado: rate_limit.allowed == Some(false) || rate_limit.limit_reached == Some(true),
+    };
+
     Ok(UsageMetric {
         usuario: normalized_user(&config.usuario),
         ferramenta: "codex".to_string(),
@@ -3032,6 +3131,7 @@ fn collect_codex_metric(
         uso_percentual_7d: weekly_used.map(round_percent),
         restante_percentual_7d: weekly_used.map(remaining_percent),
         reset_em_7d: weekly_reset.and_then(timestamp_seconds_to_iso),
+        leitura_codex: Some(leitura),
     })
 }
 
@@ -3111,6 +3211,7 @@ fn metrica_do_claude(usuario: &str, payload: ClaudeUsageResponse) -> Result<Usag
             uso_percentual_7d: None,
             restante_percentual_7d: None,
             reset_em_7d: None,
+            leitura_codex: None,
         });
     }
 
@@ -3133,6 +3234,7 @@ fn metrica_do_claude(usuario: &str, payload: ClaudeUsageResponse) -> Result<Usag
         uso_percentual_7d: seven_day_utilization.map(round_percent),
         restante_percentual_7d: seven_day_utilization.map(remaining_percent),
         reset_em_7d: seven_day_resets_at,
+        leitura_codex: None,
     })
 }
 
@@ -3767,6 +3869,7 @@ fn build_error_metric(usuario: &str, ferramenta: &str, erro: &str) -> UsageMetri
         uso_percentual_7d: None,
         restante_percentual_7d: None,
         reset_em_7d: None,
+        leitura_codex: None,
     }
 }
 
@@ -4427,8 +4530,7 @@ fn claude_org_utilization(
 
 /// Contas conectadas do provedor, cada uma com o status do login (sem rede), a
 /// chave, se e' a principal e o apelido — a lista de contas da aba do provedor.
-fn status_das_contas(config_dir: &Path, provedor: Provedor) -> Value {
-    let prefs = contas::ler_prefs(config_dir);
+fn status_das_contas(config_dir: &Path, provedor: Provedor, prefs: &contas::Prefs) -> Value {
     let contas = contas::listar(config_dir, provedor);
     // A conta da barra de tarefas e a enviada ao Loki: a escolhida, se ainda existe,
     // senao a principal (a mesma regra de `chave_da_barra`/`envia_ao_loki`, aqui
@@ -4463,7 +4565,11 @@ fn status_das_contas(config_dir: &Path, provedor: Provedor) -> Value {
 /// Contas do Claude com o status de cada login (sem rede), para a aba Claude.
 #[tauri::command]
 fn claude_auth_status(paths: State<'_, RuntimePaths>) -> Value {
-    status_das_contas(&paths.config_dir, Provedor::Claude)
+    status_das_contas(
+        &paths.config_dir,
+        Provedor::Claude,
+        &contas::ler_prefs(&paths.config_dir),
+    )
 }
 
 /// Status da reabertura automatica (ultima tentativa e conta vigiada), relido pela
@@ -4620,10 +4726,57 @@ async fn codex_login(app: AppHandle) -> Result<Value, String> {
     .map_err(|error| error.to_string())?
 }
 
-/// Contas do Codex com o status de cada login (sem rede), para a aba Codex.
+/// Contas do Codex com o status de cada login (sem rede), para a aba Codex, mais o
+/// da sessao automatica de cada uma (ligada, ultima tentativa, aviso).
 #[tauri::command]
-fn codex_auth_status(paths: State<'_, RuntimePaths>) -> Value {
-    status_das_contas(&paths.config_dir, Provedor::Codex)
+fn codex_auth_status(paths: State<'_, RuntimePaths>, shared: State<'_, Arc<SharedState>>) -> Value {
+    // Uma leitura do `contas.json` para a lista inteira: a aba relê a cada 5s.
+    let prefs = contas::ler_prefs(&paths.config_dir);
+    let mut lista = status_das_contas(&paths.config_dir, Provedor::Codex, &prefs);
+    if let Value::Array(contas) = &mut lista {
+        for conta in contas.iter_mut() {
+            let Some(chave) = conta["chave"].as_str().map(str::to_string) else {
+                continue;
+            };
+            conta["sessaoAuto"] = json!(prefs.sessao_auto(&chave));
+            conta["sessaoAutoStatus"] = json!(sessao_auto_codex::status_da_conta(&shared, &chave));
+        }
+    }
+    lista
+}
+
+/// Liga ou desliga a abertura automatica da sessao numa conta do Codex (aba Codex).
+#[tauri::command]
+fn set_conta_sessao_auto(
+    paths: State<'_, RuntimePaths>,
+    conta: String,
+    ligado: bool,
+) -> Result<(), String> {
+    contas::definir_sessao_auto(&paths.config_dir, &conta, ligado)
+}
+
+/// "Enviar teste" de uma conta do Codex: manda o "Oi" agora, sem esperar a janela
+/// parar. Volta na hora; o resultado aparece no status da conta.
+#[tauri::command]
+fn testar_sessao_auto_codex(
+    paths: State<'_, RuntimePaths>,
+    shared: State<'_, Arc<SharedState>>,
+    conta: String,
+) -> Result<(), String> {
+    sessao_auto_codex::testar(&paths, shared.inner(), &read_config(&paths), &conta)
+}
+
+/// Grava os ajustes gerais da sessao automatica do Codex (interruptor, modo e
+/// horarios) e devolve o que ficou gravado, normalizado. Vao para o `contas.json`,
+/// a' parte do auto-save do `config.json` (ver `Prefs::sessao_auto_codex`). O
+/// caminho do CLI fica o do disco (ver `contas::definir_sessao_auto_codex`).
+#[tauri::command]
+fn set_sessao_auto_codex(
+    paths: State<'_, RuntimePaths>,
+    mut ajustes: SessaoAutoConfig,
+) -> Result<SessaoAutoConfig, String> {
+    normalize_sessao_auto(&mut ajustes);
+    contas::definir_sessao_auto_codex(&paths.config_dir, ajustes)
 }
 
 /// Cancela um login pelo navegador em andamento (botao "Cancelar"): libera a porta
@@ -4838,6 +4991,7 @@ mod tests {
             uso_percentual_7d: None,
             restante_percentual_7d: None,
             reset_em_7d: None,
+            leitura_codex: None,
         };
         let metrics: BTreeMap<String, UsageMetric> = ["claude:a", "claude:b"]
             .iter()
@@ -5142,6 +5296,7 @@ exit /b 1
             force_pending: AtomicBool::new(false),
             pending_update: Mutex::new(None),
             sessao_auto: Mutex::new(SessaoAutoState::default()),
+            sessao_auto_codex: sessao_auto_codex::Estado::default(),
         });
         // O gatilho do recurso: coleta bem-sucedida da conta do CLI sem janela de sessao.
         {
@@ -5160,6 +5315,7 @@ exit /b 1
                     uso_percentual_7d: None,
                     restante_percentual_7d: None,
                     reset_em_7d: None,
+                    leitura_codex: None,
                 },
             );
         }
