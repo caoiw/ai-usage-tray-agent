@@ -30,7 +30,7 @@ mais nova — e a tela **Novidades** mostra o histórico completo. O campo `note
 ## [Não lançado]
 
 ### Adicionado
-- Codex: abertura automática da sessão — o app envia um “Oi” para abrir a janela de 5h assim que ela fica livre (ou em horários fixos), conta por conta, com o botão “Enviar teste”. Precisa do Codex CLI instalado.
+- Codex: opção “Reabrir a sessão automaticamente” — o app envia um “Oi” para abrir a janela de 5h assim que ela fica livre (ou em horários fixos), conta por conta, com o botão “Enviar teste”. Precisa do Codex CLI instalado.
 
 ## [0.2.72] - 2026-09-28
 

@@ -479,24 +479,22 @@ function renderContas(p: ProvedorConta): void {
 /// Uma linha de status (texto e cor) da sessão automática.
 type LinhaStatus = { texto: string; classe: "" | "ok" | "warn" };
 
-/// Resultado da última tentativa de abrir a sessão ("abertura" no Codex,
-/// "reabertura" no Claude), ou o envio em andamento. `null` sem tentativa ainda.
-function textoDaTentativa(st: SessaoAutoContaStatus, acao: "abertura" | "reabertura"): LinhaStatus | null {
+/// Resultado da última reabertura, ou o envio em andamento. `null` sem tentativa.
+function textoDaTentativa(st: SessaoAutoContaStatus): LinhaStatus | null {
   if (st.emExecucao) return { texto: "Enviando o “Oi”… (o CLI leva alguns segundos)", classe: "" };
   if (!st.ultimaTentativaEm) return null;
   const quando = new Date(st.ultimaTentativaEm).toLocaleString();
-  if (st.ultimoOk) return { texto: `Última ${acao} em ${quando}`, classe: "ok" };
+  if (st.ultimoOk) return { texto: `Última reabertura em ${quando}`, classe: "ok" };
   // O motivo pode faltar (falha sem mensagem do CLI); nesse caso não deixa um
   // traço solto no fim.
-  const verbo = acao === "abertura" ? "abrir" : "reabrir";
-  return { texto: `Falha ao ${verbo} em ${quando}${st.ultimoErro ? ` - ${st.ultimoErro}` : ""}`, classe: "warn" };
+  return { texto: `Falha ao reabrir em ${quando}${st.ultimoErro ? ` - ${st.ultimoErro}` : ""}`, classe: "warn" };
 }
 
 /// Linha de status da sessão automática de uma conta do Codex: o envio em
 /// andamento, o motivo de estar parada ou o resultado da última tentativa.
 function statusSessaoAutoConta(c: ContaStatus): LinhaStatus {
   const st = c.sessaoAutoStatus ?? {};
-  const tentativa = textoDaTentativa(st, "abertura");
+  const tentativa = textoDaTentativa(st);
   if (st.emExecucao && tentativa) return tentativa;
   // Desligada, a conta ainda pode ter usado o "Enviar teste" (é o jeito de
   // conferir o CLI antes de ligar): o resultado dele aparece junto.
@@ -509,7 +507,7 @@ function statusSessaoAutoConta(c: ContaStatus): LinhaStatus {
   return tentativa ?? { texto: "Aguardando a janela de 5h ficar livre.", classe: "" };
 }
 
-/// Contas do cartão "Abrir a sessão automaticamente" da aba Codex: um switch por
+/// Contas do cartão "Reabrir a sessão automaticamente" da aba Codex: um switch por
 /// conta (a função gasta cota da conta, então cada uma é ligada à parte), o status
 /// e o "Enviar teste". Redesenhada junto com a lista de contas, que o auto-refresh
 /// de 5s relê — é assim que o status acompanha o envio.
@@ -531,7 +529,7 @@ function renderSessaoAutoContas(): void {
       <div class="conta-acoes">
         <button type="button" class="btn btn-sm" data-acao="testar">Enviar teste</button>
       </div>
-      <label class="switch switch-sm" title="Abrir a sessão automaticamente nesta conta">
+      <label class="switch switch-sm" title="Reabrir a sessão automaticamente nesta conta">
         <input type="checkbox" data-conta="${escapeHtml(c.chave)}">
         <span class="switch-track"></span>
       </label>
@@ -1099,7 +1097,7 @@ function syncSessaoAuto(status?: SessaoAutoStatus): void {
   conta.hidden = conta.textContent === "";
 
   const el = $("set-claudeSessaoAutoStatus") as HTMLElement;
-  const tentativa = st ? textoDaTentativa(st, "reabertura") : null;
+  const tentativa = st ? textoDaTentativa(st) : null;
   el.hidden = !tentativa;
   el.textContent = tentativa?.texto ?? "";
   el.classList.remove("ok", "warn");

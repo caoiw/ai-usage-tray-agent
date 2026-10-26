@@ -468,12 +468,12 @@ Requisitos e detalhes:
   transcripts cujos arquivos declaram esse diretório. Nenhum projeto seu é tocado.
 - O Codex tem um recurso equivalente, com algumas diferenças: ver a seção abaixo.
 
-## Abertura automática da sessão do Codex
+## Reabertura automática da sessão do Codex
 
 O mesmo recurso para o Codex: a janela de 5h do Codex também só começa na primeira
 mensagem depois que a anterior acaba, e o app manda o "Oi" sozinho quando ela fica livre.
 
-Fica na aba **Codex** das **Configurações**, no cartão *Abrir a sessão
+Fica na aba **Codex** das **Configurações**, no cartão *Reabrir a sessão
 automaticamente*, e **vem desligado**. Há um interruptor geral, o mesmo seletor de
 modo do Claude (*Assim que expira* ou *Em horários fixos*, com as mesmas regras de
 horário) e a **lista de contas**: cada conta é ligada à parte, porque o recurso gasta
