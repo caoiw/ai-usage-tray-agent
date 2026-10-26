@@ -37,6 +37,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tauri-plugin-window-state",
  "tiny_http",
+ "toml 1.1.2+spec-1.1.0",
  "windows",
 ]
 

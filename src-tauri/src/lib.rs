@@ -464,6 +464,9 @@ struct RuntimePaths {
     /// `arquivos_config_do_cli`). Campo, e nao constante, para os testes nao lerem
     /// o arquivo real da maquina.
     config_do_cli: Vec<PathBuf>,
+    /// Configuracao pessoal do Codex, antes do CODEX_HOME isolado do disparo.
+    /// Explicita para os testes nunca lerem as preferencias reais do usuario.
+    config_codex_cli: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4052,6 +4055,10 @@ fn ensure_storage() -> Result<RuntimePaths, Box<dyn std::error::Error>> {
 }
 
 fn runtime_paths() -> Result<RuntimePaths, Box<dyn std::error::Error>> {
+    let config_codex_cli = sessao_auto_codex::arquivo_config_do_cli(
+        env::var_os("CODEX_HOME").map(PathBuf::from),
+        dirs::home_dir(),
+    );
     #[cfg(target_os = "windows")]
     {
         let app_data = env::var("APPDATA")
@@ -4066,6 +4073,7 @@ fn runtime_paths() -> Result<RuntimePaths, Box<dyn std::error::Error>> {
             config_file: app_data.join(APP_NAME_WINDOWS).join("config.json"),
             logs_dir: local_app_data.join(APP_NAME_WINDOWS).join("logs"),
             config_do_cli: arquivos_config_do_cli(),
+            config_codex_cli,
         });
     }
 
@@ -4085,6 +4093,7 @@ fn runtime_paths() -> Result<RuntimePaths, Box<dyn std::error::Error>> {
                 .join(APP_NAME_LINUX)
                 .join("logs"),
             config_do_cli: arquivos_config_do_cli(),
+            config_codex_cli,
         });
     }
 
@@ -5182,6 +5191,7 @@ mod tests {
             config_file: base.join("config.json"),
             logs_dir: base.join("logs"),
             config_do_cli: Vec::new(),
+            config_codex_cli: None,
         };
         let config = SessaoAutoConfig {
             habilitado: true,
@@ -5219,6 +5229,7 @@ exit /b 1
             config_file: base.join("config.json"),
             logs_dir: base.join("logs"),
             config_do_cli: Vec::new(),
+            config_codex_cli: None,
         };
         let config = SessaoAutoConfig {
             habilitado: true,
@@ -5282,6 +5293,7 @@ exit /b 1
             config_file: base.join("config.json"),
             logs_dir: base.join("logs"),
             config_do_cli: vec![config_do_cli],
+            config_codex_cli: None,
         };
         let mut config = AppConfig::default();
         config.providers.claude.sessao_auto = SessaoAutoConfig {

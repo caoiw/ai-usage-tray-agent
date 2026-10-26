@@ -19,7 +19,7 @@
 // - **Sem janela de sessao, fica dormente.** A OpenAI ja' suspendeu o limite de 5h
 //   uma vez, e ha' planos sem ele. Sem a janela na resposta, nada e' enviado e o
 //   status explica; quando ela volta, o recurso volta sozinho.
-// - **Disparo barato:** modelo leve e contexto minimo (ver `AJUSTES_DO_DISPARO`).
+// - **Contexto reduzido:** modelo herdado do CLI e esforco baixo (ver `AJUSTES_DO_DISPARO`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -30,7 +30,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDate, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::contas::{self, Provedor};
@@ -61,16 +61,11 @@ const ESPERA_APOS_FALHA: Duration = Duration::from_secs(5 * 60);
 /// minutos.
 const ESPERA_APOS_LIMITE: Duration = Duration::from_secs(30 * 60);
 
-/// Modelo do disparo: o mais leve do catalogo do Codex que ainda conta na janela
-/// de 5h. Os modelos "mini" sao cobrados de outra cota e nao abrem a janela.
-const MODELO_LEVE: &str = "gpt-6-luna";
-
 /// Instrucao de sistema do disparo, no lugar do prompt inteiro do agente: o "Oi"
 /// so' precisa existir para abrir a janela.
 const INSTRUCOES_DO_DISPARO: &str = "Responda apenas: ok\n";
 
-/// Ajustes que enxugam o contexto do disparo. Medido com o `--json` do CLI: o
-/// disparo foi de ~15 mil tokens de entrada para ~2,7 mil, e a saida de 13 para 5.
+/// Ajustes que enxugam o contexto do disparo. O consumo depende do modelo do CLI.
 /// O que sai: provedor que nao seja o da OpenAI, login que nao seja o ChatGPT,
 /// raciocinio (esforco no minimo que existe), a lista de skills, as instrucoes de
 /// permissoes, ambiente, colaboracao e multiagente, a busca na web e as
@@ -502,14 +497,65 @@ fn pasta_do_disparo(paths: &RuntimePaths) -> PathBuf {
     paths.config_dir.join("sessao-auto-codex")
 }
 
+/// A origem e' calculada antes de substituir o CODEX_HOME do processo filho.
+pub fn arquivo_config_do_cli(
+    codex_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    codex_home
+        .filter(|pasta| !pasta.as_os_str().is_empty())
+        .or_else(|| home.map(|pasta| pasta.join(".codex")))
+        .map(|pasta| pasta.join("config.toml"))
+}
+
+/// So' o modelo global e' herdado. Nenhum endpoint, plugin ou credencial pessoal
+/// deve entrar no ambiente isolado da conta do app.
+#[derive(Default, Deserialize, Serialize)]
+struct ModeloDoCli {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+
+fn ler_modelo_do_cli(arquivo: Option<&Path>) -> Result<ModeloDoCli, String> {
+    let Some(arquivo) = arquivo else {
+        return Ok(ModeloDoCli::default());
+    };
+    let conteudo = match fs::read_to_string(arquivo) {
+        Ok(conteudo) => conteudo,
+        Err(erro) if erro.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ModeloDoCli::default());
+        }
+        Err(_) => {
+            return Err(format!(
+                "Não foi possível ler a configuração do Codex CLI em {}.",
+                arquivo.display()
+            ))
+        }
+    };
+    // Nao devolve o erro do parser: ele pode incluir trechos com dados pessoais.
+    let modelo: ModeloDoCli = toml::from_str(&conteudo).map_err(|_| {
+        format!("Configuração do Codex CLI inválida em {}: confira o TOML e o campo model (texto não vazio).", arquivo.display())
+    })?;
+    if modelo
+        .model
+        .as_ref()
+        .is_some_and(|model| model.trim().is_empty())
+    {
+        return Err(format!(
+            "O campo model da configuração do Codex CLI em {} está vazio.",
+            arquivo.display()
+        ));
+    }
+    Ok(modelo)
+}
+
 /// Manda o "Oi" pelo Codex CLI na conta `chave`.
 ///
 /// - renova o token antes (`ensure_fresh`): a copia leva so' o `access_token`;
 /// - copia o login para `<pasta>/auth.json` e aponta o `CODEX_HOME` para la' (a
 ///   copia so' sai se for login ChatGPT, nunca chave de API);
-/// - roda numa subpasta vazia, sem config do usuario (o `CODEX_HOME` novo nao tem
-///   `config.toml`), no modelo mais leve, com o contexto enxuto e sandbox so' de
-///   leitura (ver `MODELO_LEVE` e `AJUSTES_DO_DISPARO`);
+/// - herda so' o modelo global do CLI e roda numa subpasta vazia, com contexto
+///   enxuto e sandbox so' de leitura (ver `AJUSTES_DO_DISPARO`);
 /// - os valores do `-c` vao **sem aspas**: no Windows o CLI costuma ser o shim
 ///   `codex.cmd`, que corrompe aspas (ver a armadilha do `claude.cmd` no
 ///   ONBOARDING). Sem aspas, o CLI le' o valor como texto puro;
@@ -520,6 +566,7 @@ fn abrir_sessao(
     chave: &str,
     config: &SessaoAutoConfig,
 ) -> Result<(), String> {
+    let modelo = ler_modelo_do_cli(paths.config_codex_cli.as_deref())?;
     let exe = resolve_codex_cli(config)?;
     let arquivo = arquivo_da_conta(paths, chave)
         .ok_or_else(|| "a conta não está mais conectada no app.".to_string())?;
@@ -546,6 +593,11 @@ fn abrir_sessao(
                 return Err(
                     "a conta principal mudou durante o envio; nada foi enviado.".to_string()
                 );
+            }
+            if modelo.model.is_some() {
+                let conteudo = toml::to_string(&modelo)
+                    .map_err(|_| "Não foi possível preparar o modelo do Codex CLI.".to_string())?;
+                contas::gravar_atomico(&pasta.join("config.toml"), &conteudo)?;
             }
             let instrucoes = pasta.join("instrucoes.md");
             fs::write(&instrucoes, INSTRUCOES_DO_DISPARO).map_err(|error| {
@@ -581,8 +633,7 @@ fn comando(exe: &Path, pasta: &Path, vazia: &Path, instrucoes: &Path) -> Command
         .arg("--ephemeral")
         .args(["--sandbox", "read-only"])
         .arg("-C")
-        .arg(vazia)
-        .args(["-m", MODELO_LEVE]);
+        .arg(vazia);
     for ajuste in AJUSTES_DO_DISPARO {
         command.args(["-c", ajuste]);
     }
@@ -660,6 +711,75 @@ mod tests {
 
     const CINCO_HORAS: i64 = 5 * 60 * 60;
     const AGORA: i64 = 1_800_000_000;
+
+    fn pasta_modelo(nome: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ai-usage-modelo-{nome}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn origem_do_modelo_respeita_codex_home_e_o_padrao() {
+        let home = PathBuf::from("usuario");
+        let custom = PathBuf::from("codex pessoal");
+        assert_eq!(
+            arquivo_config_do_cli(Some(custom.clone()), Some(home.clone())),
+            Some(custom.join("config.toml"))
+        );
+        for origem in [None, Some(PathBuf::new())] {
+            assert_eq!(
+                arquivo_config_do_cli(origem, Some(home.clone())),
+                Some(home.join(".codex/config.toml"))
+            );
+        }
+        assert_eq!(arquivo_config_do_cli(None, None), None);
+    }
+
+    #[test]
+    fn modelo_ausente_usa_default_e_rele_alteracoes_sem_copiar_extras() {
+        let dir = pasta_modelo("leitura");
+        let arquivo = dir.join("config.toml");
+        assert!(ler_modelo_do_cli(None).unwrap().model.is_none());
+        assert!(ler_modelo_do_cli(Some(&arquivo)).unwrap().model.is_none());
+        fs::write(&arquivo, "model_reasoning_effort = 'high'\n").unwrap();
+        assert!(ler_modelo_do_cli(Some(&arquivo)).unwrap().model.is_none());
+        let original = "model = 'modelo-teste-a'\nopenai_base_url = 'https://example.test'\n[mcp_servers.exemplo]\ncommand = 'nao-executar'\n";
+        fs::write(&arquivo, original).unwrap();
+        let modelo = ler_modelo_do_cli(Some(&arquivo)).unwrap();
+        let copia: toml::Value = toml::from_str(&toml::to_string(&modelo).unwrap()).unwrap();
+        assert_eq!(copia.as_table().unwrap().len(), 1);
+        assert_eq!(copia["model"].as_str(), Some("modelo-teste-a"));
+        assert_eq!(fs::read_to_string(&arquivo).unwrap(), original);
+        fs::write(&arquivo, "model = 'modelo-teste-b'\n").unwrap();
+        assert_eq!(
+            ler_modelo_do_cli(Some(&arquivo)).unwrap().model.as_deref(),
+            Some("modelo-teste-b")
+        );
+    }
+
+    #[test]
+    fn modelo_invalido_ou_arquivo_ilegivel_nao_vazam_conteudo() {
+        let dir = pasta_modelo("invalido");
+        let arquivo = dir.join("config.toml");
+        for invalido in [
+            "model = 42",
+            "model = ''",
+            "model = '   '",
+            "segredo-nao-exibir = \"valor-secreto",
+        ] {
+            fs::write(&arquivo, invalido).unwrap();
+            let erro = ler_modelo_do_cli(Some(&arquivo))
+                .err()
+                .expect("deve recusar");
+            assert!(erro.contains("Codex CLI"));
+            assert!(!erro.contains("segredo-nao-exibir"));
+            assert!(!erro.contains("valor-secreto"));
+        }
+        // Um diretorio no lugar do arquivo produz erro de leitura em ambos os SOs.
+        assert!(ler_modelo_do_cli(Some(&dir)).is_err());
+    }
 
     fn leitura(usado: Option<f64>, reset_em_segundos: Option<i64>) -> LeituraCodex {
         LeituraCodex {
@@ -832,6 +952,7 @@ mod tests {
             config_file: base.join("config.json"),
             logs_dir: base.join("logs"),
             config_do_cli: Vec::new(),
+            config_codex_cli: Some(base.join("cli pessoal").join("config.toml")),
         };
         let ajustes = SessaoAutoConfig {
             habilitado: true,
@@ -926,6 +1047,7 @@ mod tests {
             "ok",
             "echo %* > \"%~dp0args.txt\"\r\n\
              if exist \"%CODEX_HOME%\\auth.json\" echo sim> \"%~dp0auth.txt\"\r\n\
+             if not exist \"%CODEX_HOME%\\config.toml\" echo sim> \"%~dp0modelo-default.txt\"\r\n\
              exit /b 0\r\n",
         );
 
@@ -940,7 +1062,6 @@ mod tests {
             "forced_login_method=chatgpt",
             "skills.include_instructions=false",
             "features.plugins=false",
-            "-m gpt-6-luna",
             "model_instructions_file=",
             "Oi",
         ] {
@@ -948,6 +1069,10 @@ mod tests {
         }
         // Nada de `--disable`: um nome que o CLI nao conheca derrubaria o disparo.
         assert!(!args.contains("--disable"), "usou --disable: {args}");
+        assert!(!args
+            .split_whitespace()
+            .any(|arg| arg == "-m" || arg == "--model"));
+        assert!(paths.config_dir.join("modelo-default.txt").is_file());
         assert!(
             paths.config_dir.join("auth.txt").is_file(),
             "o CLI nao achou o login no CODEX_HOME"
@@ -956,6 +1081,62 @@ mod tests {
             !pasta_do_disparo(&paths).exists(),
             "a copia do login ficou no disco"
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn modelo_e_isolado_e_limpo_sem_segunda_tentativa() {
+        for (nome, falha) in [
+            ("modelo com espacos ok", false),
+            ("modelo com espacos falha", true),
+        ] {
+            let corpo = format!(
+                "echo rodada>> \"%~dp0rodadas.txt\"\r\ncopy \"%CODEX_HOME%\\config.toml\" \"%~dp0modelo-copiado.toml\" >nul\r\nexit /b {}\r\n",
+                i32::from(falha)
+            );
+            let (paths, chave, ajustes) = ambiente_com_cli_falso(nome, &corpo);
+            let origem = paths.config_codex_cli.as_ref().unwrap();
+            fs::create_dir_all(origem.parent().unwrap()).unwrap();
+            let original = "model = 'modelo-teste'\nopenai_base_url = 'https://example.test'\n[plugins]\nnao_copiar = true\n";
+            fs::write(origem, original).unwrap();
+            let auth_antes = fs::read(paths.config_dir.join("codex-auth.json")).unwrap();
+            assert_eq!(abrir_sessao(&paths, &chave, &ajustes).is_err(), falha);
+            let copia: toml::Value = toml::from_str(
+                &fs::read_to_string(paths.config_dir.join("modelo-copiado.toml")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(copia.as_table().unwrap().len(), 1);
+            assert_eq!(copia["model"].as_str(), Some("modelo-teste"));
+            assert_eq!(fs::read_to_string(origem).unwrap(), original);
+            assert_eq!(
+                fs::read(paths.config_dir.join("codex-auth.json")).unwrap(),
+                auth_antes
+            );
+            assert_eq!(
+                fs::read_to_string(paths.config_dir.join("rodadas.txt"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            assert!(!pasta_do_disparo(&paths).exists());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn configuracao_invalida_impede_acesso_ao_login_e_ao_cli() {
+        let (paths, chave, ajustes) =
+            ambiente_com_cli_falso("config-invalida", "echo enviado> \"%~dp0enviou.txt\"\r\n");
+        let origem = paths.config_codex_cli.as_ref().unwrap();
+        fs::create_dir_all(origem.parent().unwrap()).unwrap();
+        fs::write(origem, "model = 42").unwrap();
+        // Se tentar ler o login antes de validar a preferencia, a mensagem muda.
+        fs::write(paths.config_dir.join("codex-auth.json"), "login-invalido").unwrap();
+        let erro = abrir_sessao(&paths, &chave, &ajustes).unwrap_err();
+        assert!(erro.contains("Configuração do Codex CLI inválida"));
+        assert!(!paths.config_dir.join("enviou.txt").exists());
+        assert!(!pasta_do_disparo(&paths).exists());
     }
 
     /// A recusa por limite de uso chega explicada (e e' reconhecida para a espera

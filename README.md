@@ -501,14 +501,18 @@ Como funciona:
 - **Contra cobrança por API**: só vai login ChatGPT (assinatura). Uma conta com chave
   de API gravada é recusada, e `OPENAI_API_KEY`, `CODEX_API_KEY` e `OPENAI_BASE_URL`
   são retiradas do processo do CLI.
-- **Custo mínimo**: o disparo usa o modelo mais leve do Codex (`gpt-6-luna`), o
-  menor esforço de raciocínio, uma instrução de sistema de uma linha no lugar do
-  prompt do agente e nenhum extra (skills, plugins, ferramentas, busca na web,
-  instruções de ambiente e de permissões). Medido no CLI: ~2,7 mil tokens de entrada
-  e 5 de saída, contra ~15 mil e 13 no `codex exec` padrão. O `gpt-6-luna` conta na
-  janela de 5h; os modelos "mini" não (são cobrados de outra cota e não abririam a
-  janela). Roda numa pasta vazia, com o sandbox só de leitura e **sem** a configuração do seu
-  `~/.codex`.
+- **Modelo do CLI**: assim como no Claude, o app não fixa um modelo. A cada disparo,
+  lê somente o campo global `model` de `$CODEX_HOME/config.toml` (ou `~/.codex/config.toml`
+  quando a variável está ausente ou vazia) e o leva para a pasta isolada. Sem arquivo ou
+  sem esse campo, o CLI usa seu próprio padrão. Configuração ilegível, inválida ou
+  modelo vazio gera erro sem enviar nada; um modelo indisponível também aparece como
+  falha, sem tentar outro automaticamente. Perfis e escolhas feitas só para uma sessão
+  do terminal não são herdados. Nenhum arquivo pessoal é alterado.
+- **Contexto reduzido**: mantém esforço `low`, instrução de sistema de uma linha e
+  desativa skills, plugins, ferramentas, busca na web e instruções extras. Roda numa
+  pasta vazia, com sandbox só de leitura. O consumo depende do modelo escolhido, e a
+  abertura da janela de 5h depende de ele contar nessa cota. Outras configurações
+  pessoais, como endpoints e plugins, não são copiadas.
 - **O login da conta continua só com o app**: o app renova o token da conta antes do
   disparo, e a cópia entregue ao CLI vai **sem** o token de renovação. Assim o CLI
   usa o login, mas não tem como renová-lo por conta própria — o que invalidaria o

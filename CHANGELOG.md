@@ -29,6 +29,11 @@ mais nova — e a tela **Novidades** mostra o histórico completo. O campo `note
 
 ## [Não lançado]
 
+### Corrigido
+- Codex: a reabertura automática da sessão respeita o modelo configurado no CLI; quando não há modelo configurado, usa o padrão do CLI, mantendo o esforço reduzido.
+
+## [0.2.73] - 2026-10-26
+
 ### Adicionado
 - Codex: opção “Reabrir a sessão automaticamente” — o app envia um “Oi” para abrir a janela de 5h assim que ela fica livre (ou em horários fixos), conta por conta, com o botão “Enviar teste”. Precisa do Codex CLI instalado.
 
