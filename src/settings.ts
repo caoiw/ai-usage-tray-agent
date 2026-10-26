@@ -15,7 +15,8 @@ interface SessaoAutoConfig {
   modo: string;
   /** Horários do modo agendado, em `"HH:MM"` de hora local, válidos todos os dias. */
   horarios: string[];
-  /** Só editável pelo config.json; a UI apenas repassa para não zerar o valor. */
+  /** Só editável à mão no arquivo: o backend ignora o valor que a UI manda e mantém
+   * o do disco. */
   caminhoCli: string;
 }
 interface ClaudeConfig {
@@ -78,7 +79,14 @@ interface SettingsData {
   appVersion: string;
   config: AppConfig;
   sessaoAutoStatus?: SessaoAutoStatus;
+  /** Ajustes gerais da sessão automática do Codex. Moram no contas.json (o
+   * config.json não pode ganhar campos: a versão anterior o regrava). */
+  sessaoAutoCodex?: SessaoAutoConfig;
 }
+/** Sessão automática de uma conta do Codex (memória do backend), na lista de
+ * contas. O `aviso` diz por que nada está sendo enviado agora (sem janela de 5h,
+ * cota esgotada). */
+type SessaoAutoContaStatus = Pick<SessaoAutoStatus, "ultimaTentativaEm" | "ultimoOk" | "ultimoErro" | "emExecucao" | "aviso">;
 interface SaveSettings {
   config: AppConfig;
   autostart: boolean;
@@ -112,14 +120,9 @@ function fillForm(data: SettingsData): void {
   $<HTMLInputElement>("set-claudeHab").checked = claude.habilitado !== false;
   $<HTMLInputElement>("set-claudeTaskbar").checked = claude.mostraNaTaskbarWindows !== false;
   syncCartoes();
-  // Guarda o caminho do CLI (editável só pelo config.json) para devolvê-lo no save
-  // — o painel manda o bloco `providers` inteiro, então omitir zeraria o valor.
-  claudeSessaoAutoCliPath = claude.sessaoAuto?.caminhoCli ?? "";
-  $<HTMLInputElement>("set-claudeSessaoAuto").checked = !!claude.sessaoAuto?.habilitado;
-  setRadio("claudeSessaoAutoModo", claude.sessaoAuto?.modo === "agendado" ? "agendado" : "automatico");
-  claudeSessaoAutoHorarios = [...(claude.sessaoAuto?.horarios ?? [])];
-  renderSessaoAutoHorarios();
+  preencherSessaoAuto("claude", claude.sessaoAuto);
   syncSessaoAuto(data.sessaoAutoStatus);
+  syncSessaoAutoCampos("codex");
 
   $<HTMLSelectElement>("set-barraLado").value = barra.lado === "esquerda" ? "esquerda" : "direita";
   $<HTMLInputElement>("set-barraDesloc").value = String(barra.deslocamento ?? 0);
@@ -175,12 +178,7 @@ function collect(): SaveSettings {
       claude: {
         habilitado: $<HTMLInputElement>("set-claudeHab").checked,
         mostraNaTaskbarWindows: $<HTMLInputElement>("set-claudeTaskbar").checked,
-        sessaoAuto: {
-          habilitado: $<HTMLInputElement>("set-claudeSessaoAuto").checked,
-          modo: sessaoAutoModo(),
-          horarios: claudeSessaoAutoHorarios,
-          caminhoCli: claudeSessaoAutoCliPath,
-        },
+        sessaoAuto: ajustesSessaoAuto("claude"),
       },
     },
     barraTarefas: {
@@ -391,6 +389,9 @@ interface ContaStatus {
   connected: boolean;
   needsReconnect: boolean;
   email: string | null;
+  /** Só no Codex: a sessão automática está ligada nesta conta, e o status dela. */
+  sessaoAuto?: boolean;
+  sessaoAutoStatus?: SessaoAutoContaStatus;
 }
 
 interface ProvedorUi {
@@ -472,12 +473,104 @@ function renderContas(p: ProvedorConta): void {
   renderWidgetContas(p);
   renderEscolhaContas(p, "barra", (c) => c.naBarra);
   renderEscolhaContas(p, "envio", (c) => c.enviada);
+  if (p === "codex") renderSessaoAutoContas();
+}
+
+/// Uma linha de status (texto e cor) da sessão automática.
+type LinhaStatus = { texto: string; classe: "" | "ok" | "warn" };
+
+/// Resultado da última reabertura, ou o envio em andamento. `null` sem tentativa.
+function textoDaTentativa(st: SessaoAutoContaStatus): LinhaStatus | null {
+  if (st.emExecucao) return { texto: "Enviando o “Oi”… (o CLI leva alguns segundos)", classe: "" };
+  if (!st.ultimaTentativaEm) return null;
+  const quando = new Date(st.ultimaTentativaEm).toLocaleString();
+  if (st.ultimoOk) return { texto: `Última reabertura em ${quando}`, classe: "ok" };
+  // O motivo pode faltar (falha sem mensagem do CLI); nesse caso não deixa um
+  // traço solto no fim.
+  return { texto: `Falha ao reabrir em ${quando}${st.ultimoErro ? ` - ${st.ultimoErro}` : ""}`, classe: "warn" };
+}
+
+/// Linha de status da sessão automática de uma conta do Codex: o envio em
+/// andamento, o motivo de estar parada ou o resultado da última tentativa.
+function statusSessaoAutoConta(c: ContaStatus): LinhaStatus {
+  const st = c.sessaoAutoStatus ?? {};
+  const tentativa = textoDaTentativa(st);
+  if (st.emExecucao && tentativa) return tentativa;
+  // Desligada, a conta ainda pode ter usado o "Enviar teste" (é o jeito de
+  // conferir o CLI antes de ligar): o resultado dele aparece junto.
+  if (!c.sessaoAuto) {
+    return tentativa
+      ? { texto: `Desligada nesta conta. ${tentativa.texto}`, classe: tentativa.classe }
+      : { texto: "Desligada nesta conta.", classe: "" };
+  }
+  if (st.aviso) return { texto: st.aviso, classe: "warn" };
+  return tentativa ?? { texto: "Aguardando a janela de 5h ficar livre.", classe: "" };
+}
+
+/// Contas do cartão "Reabrir a sessão automaticamente" da aba Codex: um switch por
+/// conta (a função gasta cota da conta, então cada uma é ligada à parte), o status
+/// e o "Enviar teste". Redesenhada junto com a lista de contas, que o auto-refresh
+/// de 5s relê — é assim que o status acompanha o envio.
+function renderSessaoAutoContas(): void {
+  const contas = PROVEDORES.codex.contas.filter((c) => c.connected);
+  const lista = $("set-codexSessaoAutoContas");
+  $("set-codexSessaoAutoSemContas").hidden = contas.length > 0;
+  // O esqueleto das linhas só é recriado quando as contas mudam: o auto-refresh
+  // traz só o status novo, e recriar o switch e o botão debaixo do cursor faria um
+  // clique no instante da troca se perder.
+  const linhas = Array.from(lista.querySelectorAll<HTMLElement>(".conta"));
+  const mesmasContas = linhas.length === contas.length && linhas.every((linha, i) => linha.dataset.conta === contas[i].chave);
+  if (!mesmasContas) {
+    lista.innerHTML = contas.map((c) => `<div class="conta" data-conta="${escapeHtml(c.chave)}">
+      <div class="conta-info">
+        <div class="conta-nome"></div>
+        <div class="conta-status"></div>
+      </div>
+      <div class="conta-acoes">
+        <button type="button" class="btn btn-sm" data-acao="testar">Enviar teste</button>
+      </div>
+      <label class="switch switch-sm" title="Reabrir a sessão automaticamente nesta conta">
+        <input type="checkbox" data-conta="${escapeHtml(c.chave)}">
+        <span class="switch-track"></span>
+      </label>
+    </div>`).join("");
+  }
+  const provedorLigado = $<HTMLInputElement>("set-codexHab").checked;
+  lista.querySelectorAll<HTMLElement>(".conta").forEach((linha, i) => {
+    const c = contas[i];
+    const { texto, classe } = statusSessaoAutoConta(c);
+    linha.querySelector(".conta-nome")!.textContent = rotuloConta(c);
+    const status = linha.querySelector(".conta-status")!;
+    status.textContent = texto;
+    status.className = `conta-status ${classe}`;
+    linha.querySelector<HTMLButtonElement>('button[data-acao="testar"]')!.disabled =
+      !provedorLigado || !!c.sessaoAutoStatus?.emExecucao;
+    const ligada = linha.querySelector<HTMLInputElement>("input[data-conta]")!;
+    ligada.checked = !!c.sessaoAuto;
+    ligada.disabled = !provedorLigado;
+  });
+}
+
+/// "Enviar teste": manda o "Oi" agora na conta. O backend volta na hora; o
+/// resultado chega pelo status da conta.
+async function testarSessaoAuto(chave: string): Promise<void> {
+  try {
+    await invoke("testar_sessao_auto_codex", { conta: chave });
+  } catch (e) {
+    setMsg("Falha ao enviar o teste: " + (e instanceof Error ? e.message : String(e)), "err");
+  }
+  await loadContas("codex", true);
+}
+
+/// Rótulo curto da conta: o apelido, senão o e-mail.
+function rotuloConta(c: ContaStatus): string {
+  return c.apelido ?? c.email ?? "Conta sem e-mail";
 }
 
 /// Nome da conta nas listas das abas Widget, Barra e Envio: apelido, com o e-mail
 /// embaixo (sem apelido, o e-mail é o nome).
 function nomeDaConta(c: ContaStatus): string {
-  const nome = c.apelido ?? c.email ?? "Conta sem e-mail";
+  const nome = rotuloConta(c);
   const email = c.apelido && c.email ? `<span class="prov-conta-email">${escapeHtml(c.email)}</span>` : "";
   return `<span class="prov-conta-textos"><span class="prov-conta-nome">${escapeHtml(nome)}</span>${email}</span>`;
 }
@@ -741,6 +834,8 @@ export async function loadSettings(): Promise<void> {
   setMsg("");
   try {
     const data = await invoke<SettingsData>("get_settings");
+    // O cartão usa contas.json: só a carga inicial e seu próprio save o preenchem.
+    preencherSessaoAuto("codex", data.sessaoAutoCodex);
     fillForm(data);
     void loadEnvioToggles();
     void loadContas("codex");
@@ -818,23 +913,69 @@ function syncProviderHints(): void {
   syncProviderNotes();
 }
 
-/// Caminho do Claude Code CLI vindo do config.json. A UI não edita (é um escape
-/// para instalações fora do PATH), mas precisa devolvê-lo no save: o painel manda
-/// o bloco `providers` inteiro, então omitir o campo apagaria o valor do disco.
-let claudeSessaoAutoCliPath = "";
-
 /// Último status conhecido da reabertura automática. Chega no `get_settings` e na
 /// releitura de 5s (`get_sessao_auto_status`), então é preservado entre os `sync`
 /// disparados pelo próprio toggle.
 let lastSessaoAutoStatus: SessaoAutoStatus | undefined;
 
-/// Horários do modo agendado ("HH:MM", ordenados). Fonte da verdade da lista
-/// enquanto o painel está aberto: os chips e o save leem daqui, porque não há um
-/// campo de formulário que caiba uma lista.
-let claudeSessaoAutoHorarios: string[] = [];
+/// Horários do modo agendado ("HH:MM", ordenados), por provedor. Fonte da verdade
+/// da lista enquanto o painel está aberto: os chips e o save leem daqui, porque
+/// não há um campo de formulário que caiba uma lista.
+const sessaoAutoHorarios: Record<ProvedorConta, string[]> = { claude: [], codex: [] };
 
-const sessaoAutoModo = (): "automatico" | "agendado" =>
-  radioValue("claudeSessaoAutoModo") === "agendado" ? "agendado" : "automatico";
+const sessaoAutoModo = (p: ProvedorConta): "automatico" | "agendado" =>
+  radioValue(`${p}SessaoAutoModo`) === "agendado" ? "agendado" : "automatico";
+
+/// Preenche o cartão de sessão automática do provedor com os ajustes salvos.
+function preencherSessaoAuto(p: ProvedorConta, ajustes: SessaoAutoConfig | undefined): void {
+  $<HTMLInputElement>(`set-${p}SessaoAuto`).checked = !!ajustes?.habilitado;
+  setRadio(`${p}SessaoAutoModo`, ajustes?.modo === "agendado" ? "agendado" : "automatico");
+  sessaoAutoHorarios[p] = [...(ajustes?.horarios ?? [])];
+  renderSessaoAutoHorarios(p);
+}
+
+/// Ajustes do cartão como vão para o backend.
+function ajustesSessaoAuto(p: ProvedorConta): SessaoAutoConfig {
+  return {
+    habilitado: $<HTMLInputElement>(`set-${p}SessaoAuto`).checked,
+    modo: sessaoAutoModo(p),
+    horarios: sessaoAutoHorarios[p],
+    // O caminho do CLI só é editado à mão no arquivo; o backend mantém o do disco.
+    caminhoCli: "",
+  };
+}
+
+/// Cresce a cada gravação da sessão automática do Codex: só a resposta da mais
+/// recente re-preenche o cartão (mesma ideia do `saveSeq` do auto-save).
+let sessaoAutoCodexSeq = 0;
+
+/// Grava os ajustes do cartão. O Claude vai no auto-save do config.json; o Codex,
+/// no contas.json (`set_sessao_auto_codex`).
+async function salvarSessaoAuto(p: ProvedorConta): Promise<void> {
+  if (p === "claude") {
+    scheduleAutoSave();
+    return;
+  }
+  const seq = ++sessaoAutoCodexSeq;
+  try {
+    const gravado = await invoke<SessaoAutoConfig>("set_sessao_auto_codex", { ajustes: ajustesSessaoAuto("codex") });
+    // Só a resposta da edição mais recente pode normalizar o cartão.
+    if (seq === sessaoAutoCodexSeq) {
+      preencherSessaoAuto("codex", gravado);
+      syncSessaoAutoCampos("codex");
+    }
+    setSaved();
+  } catch (e) {
+    setMsg("Falha ao salvar a sessão automática do Codex: " + (e instanceof Error ? e.message : String(e)), "err");
+  }
+}
+
+/// Reflete os campos do cartão depois de uma mudança (no Claude, junto com o
+/// status da reabertura).
+function syncSessaoAutoDe(p: ProvedorConta): void {
+  if (p === "claude") syncSessaoAuto();
+  else syncSessaoAutoCampos("codex");
+}
 
 /// Minuto do dia de um "HH:MM" já normalizado (usado só para achar o próximo).
 const horarioEmMinutos = (horario: string): number => {
@@ -855,10 +996,10 @@ function normHorario(valor: string): string | null {
 
 /// Desenha um chip por horário salvo, cada um com o botão de remover. Recriado
 /// inteiro a cada mudança: a lista é curta e assim não sobra listener velho.
-function renderSessaoAutoHorarios(): void {
-  const lista = $("set-claudeSessaoAutoLista");
+function renderSessaoAutoHorarios(p: ProvedorConta): void {
+  const lista = $(`set-${p}SessaoAutoLista`);
   lista.textContent = "";
-  claudeSessaoAutoHorarios.forEach((horario) => {
+  sessaoAutoHorarios[p].forEach((horario) => {
     const chip = document.createElement("span");
     chip.className = "horario";
     chip.append(horario);
@@ -868,10 +1009,10 @@ function renderSessaoAutoHorarios(): void {
     remover.title = `Remover ${horario}`;
     remover.setAttribute("aria-label", `Remover ${horario}`);
     remover.addEventListener("click", () => {
-      claudeSessaoAutoHorarios = claudeSessaoAutoHorarios.filter((h) => h !== horario);
-      renderSessaoAutoHorarios();
-      syncSessaoAuto();
-      scheduleAutoSave();
+      sessaoAutoHorarios[p] = sessaoAutoHorarios[p].filter((h) => h !== horario);
+      renderSessaoAutoHorarios(p);
+      syncSessaoAutoDe(p);
+      void salvarSessaoAuto(p);
     });
     chip.append(remover);
     lista.append(chip);
@@ -880,38 +1021,50 @@ function renderSessaoAutoHorarios(): void {
 
 /// Adiciona o horário do campo à lista (ordenada, sem repetir) e salva. Ordenar
 /// "HH:MM" como texto já dá a ordem cronológica (as horas são zero-padded).
-function addSessaoAutoHorario(): void {
-  const input = $<HTMLInputElement>("set-claudeSessaoAutoHora");
+function addSessaoAutoHorario(p: ProvedorConta): void {
+  const input = $<HTMLInputElement>(`set-${p}SessaoAutoHora`);
   const horario = normHorario(input.value);
   if (!horario) return;
   input.value = "";
-  if (claudeSessaoAutoHorarios.includes(horario)) return;
-  claudeSessaoAutoHorarios = [...claudeSessaoAutoHorarios, horario].sort();
-  renderSessaoAutoHorarios();
-  syncSessaoAuto();
-  scheduleAutoSave();
+  if (sessaoAutoHorarios[p].includes(horario)) return;
+  sessaoAutoHorarios[p] = [...sessaoAutoHorarios[p], horario].sort();
+  renderSessaoAutoHorarios(p);
+  syncSessaoAutoDe(p);
+  void salvarSessaoAuto(p);
 }
 
 /// Explica o modo escolhido. No agendado, mostra qual é o próximo horário — é o
 /// jeito mais rápido de o usuário confirmar que a lista faz o que ele espera.
-function sessaoAutoModoDesc(): string {
-  if (sessaoAutoModo() !== "agendado") {
+function sessaoAutoModoDesc(p: ProvedorConta): string {
+  const horarios = sessaoAutoHorarios[p];
+  if (sessaoAutoModo(p) !== "agendado") {
     return "Assim que a janela de 5h expira, o app abre a próxima sozinho.";
   }
-  if (claudeSessaoAutoHorarios.length === 0) return "A sessão só é aberta nos horários que você escolher.";
+  if (horarios.length === 0) return "A sessão só é aberta nos horários que você escolher.";
   const agora = new Date();
   const minutosAgora = agora.getHours() * 60 + agora.getMinutes();
-  const proximo = claudeSessaoAutoHorarios.find((h) => horarioEmMinutos(h) > minutosAgora);
+  const proximo = horarios.find((h) => horarioEmMinutos(h) > minutosAgora);
   return proximo
     ? `Próximo horário: hoje às ${proximo}.`
-    : `Próximo horário: amanhã às ${claudeSessaoAutoHorarios[0]}.`;
+    : `Próximo horário: amanhã às ${horarios[0]}.`;
 }
 
-/// Mostra o resultado da última tentativa abaixo do toggle — é onde o usuário
-/// descobre que o CLI não está instalado ou que o login dele expirou — e revela
-/// as opções de modo/horários só quando a reabertura está ligada.
-/// Relê o status da reabertura automática (última tentativa e conta vigiada) sem
-/// recarregar o formulário inteiro.
+/// Mostra as opções de modo/horários só quando a função está ligada, e avisa do
+/// agendado sem horário.
+function syncSessaoAutoCampos(p: ProvedorConta): void {
+  const ligado = $<HTMLInputElement>(`set-${p}SessaoAuto`).checked;
+  const agendado = sessaoAutoModo(p) === "agendado";
+  ($(`set-${p}SessaoAutoBody`) as HTMLElement).hidden = !ligado;
+  ($(`set-${p}SessaoAutoHorariosField`) as HTMLElement).hidden = !agendado;
+  // Agendado sem horário nenhum não abre nada: avisa em vez de fingir que está
+  // funcionando.
+  ($(`set-${p}SessaoAutoWarn`) as HTMLElement).hidden =
+    !(ligado && agendado && sessaoAutoHorarios[p].length === 0);
+  $(`set-${p}SessaoAutoModoDesc`).textContent = sessaoAutoModoDesc(p);
+}
+
+/// Relê o status da reabertura automática do Claude (última tentativa e conta
+/// vigiada) sem recarregar o formulário inteiro.
 async function loadSessaoAutoStatus(): Promise<void> {
   try {
     syncSessaoAuto(await invoke<SessaoAutoStatus>("get_sessao_auto_status"));
@@ -920,18 +1073,12 @@ async function loadSessaoAutoStatus(): Promise<void> {
   }
 }
 
+/// Reabertura do Claude: os campos do cartão, a conta vigiada e o resultado da
+/// última tentativa abaixo do toggle — é onde o usuário descobre que o CLI não
+/// está instalado ou que o login dele expirou.
 function syncSessaoAuto(status?: SessaoAutoStatus): void {
   if (status !== undefined) lastSessaoAutoStatus = status;
-
-  const ligado = $<HTMLInputElement>("set-claudeSessaoAuto").checked;
-  const agendado = sessaoAutoModo() === "agendado";
-  ($("set-claudeSessaoAutoBody") as HTMLElement).hidden = !ligado;
-  ($("set-claudeSessaoAutoHorariosField") as HTMLElement).hidden = !agendado;
-  // Agendado sem horário nenhum não reabre nada: avisa em vez de fingir que está
-  // funcionando.
-  ($("set-claudeSessaoAutoWarn") as HTMLElement).hidden =
-    !(ligado && agendado && claudeSessaoAutoHorarios.length === 0);
-  $("set-claudeSessaoAutoModoDesc").textContent = sessaoAutoModoDesc();
+  syncSessaoAutoCampos("claude");
 
   const st = lastSessaoAutoStatus;
   // Qual conta decide o disparo: a do login do CLI, que é onde o `claude -p` abre
@@ -950,27 +1097,11 @@ function syncSessaoAuto(status?: SessaoAutoStatus): void {
   conta.hidden = conta.textContent === "";
 
   const el = $("set-claudeSessaoAutoStatus") as HTMLElement;
-  if (!st?.ultimaTentativaEm) {
-    el.hidden = true;
-    el.textContent = "";
-    return;
-  }
-  el.hidden = false;
+  const tentativa = st ? textoDaTentativa(st) : null;
+  el.hidden = !tentativa;
+  el.textContent = tentativa?.texto ?? "";
   el.classList.remove("ok", "warn");
-  if (st.emExecucao) {
-    el.textContent = "Enviando o “Oi”… (o CLI leva alguns segundos)";
-    return;
-  }
-  const quando = new Date(st.ultimaTentativaEm).toLocaleString();
-  if (st.ultimoOk) {
-    el.classList.add("ok");
-    el.textContent = `Última reabertura em ${quando}`;
-  } else {
-    el.classList.add("warn");
-    // O motivo pode faltar (falha sem mensagem do CLI); nesse caso não deixa um
-    // traço solto no fim.
-    el.textContent = `Falha ao reabrir em ${quando}${st.ultimoErro ? ` - ${st.ultimoErro}` : ""}`;
-  }
+  if (tentativa?.classe) el.classList.add(tentativa.classe);
 }
 
 /// Aviso por provedor (abas Envio, Barra de tarefas e Widget): se o provedor está
@@ -1053,16 +1184,39 @@ export function initSettings(): void {
     void loadSessaoAutoStatus();
   });
   $("set-claudeSessaoAutoModo").addEventListener("change", () => syncSessaoAuto());
-  $("set-claudeSessaoAutoAdd").addEventListener("click", addSessaoAutoHorario);
-  // Enter no campo de hora adiciona, em vez de nada acontecer.
-  $("set-claudeSessaoAutoHora").addEventListener("keydown", (e) => {
-    if ((e as KeyboardEvent).key !== "Enter") return;
-    e.preventDefault();
-    addSessaoAutoHorario();
+  for (const p of ["claude", "codex"] as const) {
+    $(`set-${p}SessaoAutoAdd`).addEventListener("click", () => addSessaoAutoHorario(p));
+    // Enter no campo de hora adiciona, em vez de nada acontecer.
+    $(`set-${p}SessaoAutoHora`).addEventListener("keydown", (e) => {
+      if ((e as KeyboardEvent).key !== "Enter") return;
+      e.preventDefault();
+      addSessaoAutoHorario(p);
+    });
+    // Escolher uma hora no campo não muda o config (só entra na lista pelo
+    // "Adicionar"), então o "change" dele não deve chegar ao auto-save.
+    $(`set-${p}SessaoAutoHora`).addEventListener("change", (e) => e.stopPropagation());
+  }
+  // Sessão automática do Codex: grava no contas.json (set_sessao_auto_codex e, por
+  // conta, set_conta_sessao_auto), então nenhum "change" do cartão vai para o
+  // auto-save do config.json.
+  $("set-codexSessaoAutoCard").addEventListener("change", (e) => {
+    e.stopPropagation();
+    const input = e.target as HTMLInputElement;
+    const chave = input.dataset.conta;
+    if (chave) {
+      void salvarContaDaAba("codex", "set_conta_sessao_auto", { conta: chave, ligado: input.checked }, "Falha ao salvar a conta da sessão automática");
+      return;
+    }
+    syncSessaoAutoCampos("codex");
+    void salvarSessaoAuto("codex");
   });
-  // Escolher uma hora no campo não muda o config (só entra na lista pelo
-  // "Adicionar"), então o "change" dele não deve chegar ao auto-save.
-  $("set-claudeSessaoAutoHora").addEventListener("change", (e) => e.stopPropagation());
+  $("set-codexSessaoAutoContas").addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-acao="testar"]');
+    const chave = btn?.closest<HTMLElement>(".conta")?.dataset.conta;
+    if (!btn || !chave) return;
+    btn.disabled = true;
+    void testarSessaoAuto(chave);
+  });
   $("set-barraCor").addEventListener("input", syncColorPicker);
   $("set-barraCorPicker").addEventListener("input", () => {
     $<HTMLInputElement>("set-barraCor").value = $<HTMLInputElement>("set-barraCorPicker").value;

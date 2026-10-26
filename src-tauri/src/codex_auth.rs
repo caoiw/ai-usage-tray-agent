@@ -567,10 +567,14 @@ pub fn status(path: &Path) -> Value {
 /// Renova via `refresh_token` quando o token esta' perto de expirar. Erro se nao ha
 /// login.
 pub fn ensure_fresh(client: &Client, path: &Path) -> Result<PathBuf, String> {
+    // Uma renovacao por vez: o `refresh_token` e' de uso unico (a OpenAI o
+    // rotaciona), entao duas renovacoes simultaneas da mesma conta (coleta,
+    // dashboard, sessao automatica) fariam a segunda falhar com "refresh token
+    // already used" e a conta pedir "Reconectar".
+    let trava = trava_da_conta(path);
+    let _trava = travar(&trava);
     let path = path.to_path_buf();
-    let mut auth = read_stored(&path).filter(has_access_token).ok_or_else(|| {
-        "Codex não conectado. Faça o login pelo navegador nas Configurações.".to_string()
-    })?;
+    let mut auth = ler_conectado(&path)?;
 
     let needs_refresh = match auth.expires_at {
         Some(expires_at) => now_ms() + REFRESH_SKEW_SECS * 1000 >= expires_at,
@@ -613,4 +617,161 @@ pub fn ensure_fresh(client: &Client, path: &Path) -> Result<PathBuf, String> {
     }
 
     Ok(path)
+}
+
+/// Le' a conta de `path`, exigindo um login com `access_token`.
+fn ler_conectado(path: &Path) -> Result<StoredAuth, String> {
+    read_stored(path).filter(has_access_token).ok_or_else(|| {
+        "Codex não conectado. Faça o login pelo navegador nas Configurações.".to_string()
+    })
+}
+
+/// Trava da renovacao dos tokens da conta em `arquivo`. Uma por conta: a renovacao
+/// segura a trava durante a chamada de rede, e uma conta lenta nao pode segurar as
+/// outras.
+fn trava_da_conta(arquivo: &Path) -> Arc<Mutex<()>> {
+    static TRAVAS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    // O mesmo arquivo escrito de outro jeito (relativo, outra caixa no Windows) tem
+    // de cair na mesma trava. Caminho absoluto e, no Windows, em minusculas — sem
+    // `canonicalize`, que depende de o arquivo existir: durante a troca da conta
+    // principal ele some por um instante, e a chave mudaria no meio do caminho.
+    let absoluto = std::path::absolute(arquivo).unwrap_or_else(|_| arquivo.to_path_buf());
+    let chave = if cfg!(windows) {
+        PathBuf::from(absoluto.to_string_lossy().to_lowercase())
+    } else {
+        absoluto
+    };
+    TRAVAS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(chave)
+        .or_default()
+        .clone()
+}
+
+fn travar(trava: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    trava
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Grava em `destino` um `auth.json` no formato do Codex CLI com o login da conta
+/// em `arquivo`, para o disparo da sessao automatica rodar **nessa** conta (com
+/// `CODEX_HOME` apontando para a pasta de `destino`). Devolve a identidade da conta
+/// copiada — da mesma leitura da copia —, para quem chama conferir que copiou a
+/// conta que queria.
+///
+/// E' tambem a guarda de cobranca: so' copia login ChatGPT (assinatura). Uma conta
+/// com chave de API gravada faria o CLI cobrar por requisicao, num pool que nem
+/// abre a janela de 5h.
+///
+/// O `refresh_token` vai **vazio**: o CLI usa so' o `access_token` (quem chama roda
+/// `ensure_fresh` antes, para ele estar valido) e nao tem como renovar o login. Uma
+/// renovacao feita pelo CLI rotacionaria o `refresh_token` fora do arquivo do app,
+/// e a coleta perderia o login. Vazio, e nao ausente/nulo: sem o campo, o CLI nao
+/// reconhece o login (conferido no CLI 0.163). O `last_refresh` vai com o instante
+/// atual, para o CLI nem tentar renovar.
+pub fn copiar_para_cli(arquivo: &Path, destino: &Path) -> Result<String, String> {
+    let auth = ler_conectado(arquivo)?;
+    if auth
+        .openai_api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        return Err(
+            "a conta tem uma chave de API gravada; o disparo foi recusado para não gerar cobrança por uso da API."
+                .to_string(),
+        );
+    }
+    if auth.refresh_error.is_some() {
+        return Err(
+            "a sessão desta conta expirou. Reconecte a conta para a abertura automática funcionar."
+                .to_string(),
+        );
+    }
+    if auth.tokens.id_token.as_deref().is_none_or(str::is_empty) {
+        return Err(
+            "o login desta conta está incompleto (sem id_token). Reconecte a conta.".to_string(),
+        );
+    }
+    let copia = json!({
+        "OPENAI_API_KEY": Value::Null,
+        "tokens": {
+            "id_token": auth.tokens.id_token,
+            "access_token": auth.tokens.access_token,
+            "refresh_token": "",
+            "account_id": auth.tokens.account_id,
+        },
+        "last_refresh": Utc::now().to_rfc3339(),
+    });
+    let conteudo = serde_json::to_string_pretty(&copia).map_err(|error| error.to_string())?;
+    crate::contas::gravar_atomico(destino, &format!("{conteudo}\n"))?;
+    Ok(identity_of(&auth))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pasta(nome: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ai-usage-codex-auth-{nome}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn conta() -> StoredAuth {
+        StoredAuth {
+            tokens: StoredTokens {
+                id_token: Some("id".to_string()),
+                access_token: Some("acesso".to_string()),
+                refresh_token: Some("r1".to_string()),
+                account_id: Some("conta-1".to_string()),
+            },
+            email: Some("teste@exemplo.com".to_string()),
+            expires_at: Some(1),
+            ..StoredAuth::default()
+        }
+    }
+
+    #[test]
+    fn copia_tem_o_formato_do_cli_sem_o_refresh_token_e_recusa_chave_de_api() {
+        let dir = pasta("copia");
+        let arquivo = dir.join("conta.json");
+        let destino = dir.join("home").join("auth.json");
+        write_stored(&arquivo, &conta()).unwrap();
+
+        let identidade = copiar_para_cli(&arquivo, &destino).unwrap();
+        assert_eq!(identidade, identity_of(&conta()));
+        let gravado: Value =
+            serde_json::from_str(&std::fs::read_to_string(&destino).unwrap()).unwrap();
+        assert_eq!(gravado["tokens"]["access_token"], "acesso");
+        // O CLI nao recebe como renovar o login (e rotacionar o token do app).
+        assert_eq!(gravado["tokens"]["refresh_token"], "");
+        assert!(gravado["OPENAI_API_KEY"].is_null());
+        assert!(gravado["last_refresh"].is_string());
+        // Campos so' do app nao vao para o CLI.
+        assert!(gravado.get("email").is_none());
+        // O arquivo da conta continua com o token de verdade.
+        assert_eq!(
+            read_stored(&arquivo)
+                .unwrap()
+                .tokens
+                .refresh_token
+                .as_deref(),
+            Some("r1")
+        );
+
+        let mut com_chave = conta();
+        com_chave.openai_api_key = Some("sk-teste".to_string());
+        write_stored(&arquivo, &com_chave).unwrap();
+        assert!(copiar_para_cli(&arquivo, &destino).is_err());
+
+        let mut expirada = conta();
+        expirada.refresh_error = Some("falhou".to_string());
+        write_stored(&arquivo, &expirada).unwrap();
+        assert!(copiar_para_cli(&arquivo, &destino).is_err());
+    }
 }

@@ -334,6 +334,14 @@ pub struct Prefs {
     /// se a escolhida sumiu), a principal.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub conta_enviada: BTreeMap<String, String>,
+    /// Sessao automatica do Codex: interruptor geral, modo e horarios (cada conta
+    /// ainda e' ligada em `PrefsConta::sessao_auto`). Mora aqui, e nao no
+    /// `config.json`, porque o formato do `config.json` nao pode mudar (ver o teste
+    /// `config_json_mantem_o_formato_da_versao_anterior`). A versao anterior tambem
+    /// regrava este arquivo so' com o que conhece; se isso acontecer, o recurso
+    /// volta desligado, que e' o padrao seguro. Ausente = desligada.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessao_auto_codex: Option<crate::SessaoAutoConfig>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -346,6 +354,11 @@ pub struct PrefsConta {
     /// `widget.mostraClaude/Codex` do config.json, que a versao antiga tambem le'.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mostra_no_widget: Option<bool>,
+    /// `Some(true)`: a sessao automatica abre a janela de 5h desta conta (so' o
+    /// Codex usa, por conta). Ausente = desligada: a funcao gasta cota da conta,
+    /// entao so' roda com opt-in explicito.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessao_auto: Option<bool>,
 }
 
 impl Prefs {
@@ -373,6 +386,19 @@ impl Prefs {
             .get(chave)
             .and_then(|conta| conta.mostra_no_widget)
             .unwrap_or(true)
+    }
+
+    /// A sessao automatica esta' ligada nesta conta.
+    pub fn sessao_auto(&self, chave: &str) -> bool {
+        self.contas
+            .get(chave)
+            .and_then(|conta| conta.sessao_auto)
+            .unwrap_or(false)
+    }
+
+    /// Ajustes gerais da sessao automatica do Codex (padrao: desligada).
+    pub fn sessao_auto_codex(&self) -> crate::SessaoAutoConfig {
+        self.sessao_auto_codex.clone().unwrap_or_default()
     }
 }
 
@@ -439,6 +465,34 @@ pub fn definir_mostra_no_widget(
         prefs.contas.remove(chave);
     }
     gravar_prefs_sem_trava(config_dir, &prefs)
+}
+
+/// Liga ou desliga a sessao automatica de uma conta. So' o "ligado" e' gravado.
+pub fn definir_sessao_auto(config_dir: &Path, chave: &str, ligado: bool) -> Result<(), String> {
+    let _trava = trava();
+    let mut prefs = ler_prefs_sem_trava(config_dir);
+    let conta = prefs.contas.entry(chave.to_string()).or_default();
+    conta.sessao_auto = ligado.then_some(true);
+    if *conta == PrefsConta::default() {
+        prefs.contas.remove(chave);
+    }
+    gravar_prefs_sem_trava(config_dir, &prefs)
+}
+
+/// Grava os ajustes gerais da sessao automatica do Codex (ja' normalizados por
+/// quem chama) e devolve o que ficou gravado. O `caminho_cli` recebido e'
+/// ignorado: ele so' e' editado a' mao no `contas.json` (e' o que a mensagem de
+/// "CLI nao encontrado" pede), e a tela aberta mandaria de volta um valor velho.
+pub fn definir_sessao_auto_codex(
+    config_dir: &Path,
+    mut ajustes: crate::SessaoAutoConfig,
+) -> Result<crate::SessaoAutoConfig, String> {
+    let _trava = trava();
+    let mut prefs = ler_prefs_sem_trava(config_dir);
+    ajustes.caminho_cli = prefs.sessao_auto_codex().caminho_cli;
+    prefs.sessao_auto_codex = Some(ajustes.clone());
+    gravar_prefs_sem_trava(config_dir, &prefs)?;
+    Ok(ajustes)
 }
 
 /// Grava a conta escolhida (barra ou envio) no mapa por provedor que `mapa` aponta.

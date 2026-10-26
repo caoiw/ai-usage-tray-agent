@@ -30,6 +30,11 @@ mais nova — e a tela **Novidades** mostra o histórico completo. O campo `note
 ## [Não lançado]
 
 ### Adicionado
+- Codex: opção “Reabrir a sessão automaticamente” — o app envia um “Oi” para abrir a janela de 5h assim que ela fica livre (ou em horários fixos), conta por conta, com o botão “Enviar teste”. Precisa do Codex CLI instalado.
+
+## [0.2.72] - 2026-09-28
+
+### Adicionado
 - Várias contas: conecte até duas contas do Claude e duas do Codex (ex.: trabalho e pessoal), cada uma com seu apelido.
 - Uso atual: com duas contas, o card do provedor mostra uma completa e a outra resumida ao lado; as setas do cabeçalho alternam entre elas.
 - Widget: com duas contas, mostra as duas — no modo mínimo agrupadas em Principal e Secundário; nos outros modos, um botão alterna entre elas.

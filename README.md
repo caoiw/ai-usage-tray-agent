@@ -63,8 +63,8 @@ Linux:
 Contas: o login de cada provedor fica em arquivos do próprio app, na mesma pasta do
 `config.json`. A conta **principal** fica em `claude-auth.json` / `codex-auth.json`, e a
 segunda conta de cada provedor em `contas/claude/` / `contas/codex/`. As preferências por
-conta (apelido, ordem dos cards, o que aparece no widget, a conta da barra e a conta
-enviada ao Loki) ficam em `contas.json`. O `config.json` não muda de formato por causa das
+conta (apelido, ordem dos cards, o que aparece no widget, a conta da barra, a conta
+enviada ao Loki e a abertura automática da sessão do Codex) ficam em `contas.json`. O `config.json` não muda de formato por causa das
 contas: uma versão anterior do app continua funcionando e enxerga só a principal de cada
 provedor.
 
@@ -333,7 +333,8 @@ Formulário com **abas** que cobre **todas as opções do `config.json`** (mais 
   do app enxerga.
 - **Codex**, login: OAuth pelo navegador (você entra na conta ChatGPT/OpenAI; os tokens
   ficam salvos no próprio app e são renovados sozinhos). Com uma conta já conectada, o
-  login pede a tela de entrada da OpenAI, para você poder entrar com outra.
+  login pede a tela de entrada da OpenAI, para você poder entrar com outra. Traz ainda
+  a **Abertura automática da sessão**, ligada por conta — ver a seção abaixo.
 - **Claude**, login: um botão abre a claude.ai para você entrar (inclusive com Google); a
   sessão e o Organization ID são capturados e salvos no app, com aviso para
   reconectar quando a sessão expira. Se a conta
@@ -465,8 +466,70 @@ Requisitos e detalhes:
 - A limpeza é conservadora: o CLI roda num diretório dedicado
   (`sessao-auto`, dentro da pasta de configuração), e só é removida a pasta de
   transcripts cujos arquivos declaram esse diretório. Nenhum projeto seu é tocado.
-- Vale só para o Claude. O Codex não tem equivalente enquanto a OpenAI mantiver a
-  janela de 5h suspensa (não há sessão para reancorar).
+- O Codex tem um recurso equivalente, com algumas diferenças: ver a seção abaixo.
+
+## Reabertura automática da sessão do Codex
+
+O mesmo recurso para o Codex: a janela de 5h do Codex também só começa na primeira
+mensagem depois que a anterior acaba, e o app manda o "Oi" sozinho quando ela fica livre.
+
+Fica na aba **Codex** das **Configurações**, no cartão *Reabrir a sessão
+automaticamente*, e **vem desligado**. Há um interruptor geral, o mesmo seletor de
+modo do Claude (*Assim que expira* ou *Em horários fixos*, com as mesmas regras de
+horário) e a **lista de contas**: cada conta é ligada à parte, porque o recurso gasta
+um pouco da cota de cada uma. Os ajustes ficam no `contas.json` (`sessaoAutoCodex` e
+`sessaoAuto` por conta), e não no `config.json`.
+
+Como funciona:
+
+- O disparo é `codex exec "Oi"` pelo **Codex CLI**, mas **na conta do app**, não na
+  conta em que o CLI está logado: a cada disparo o app cria uma pasta própria
+  (`sessao-auto-codex`, dentro da pasta de configuração), copia para lá o login da
+  conta e aponta o `CODEX_HOME` do CLI para ela. Assim o "Oi" cai sempre na conta
+  certa, e nada é gravado no seu `~/.codex`. A pasta, com a cópia do login, é
+  apagada ao fim de cada disparo — inclusive quando ele falha.
+- **Janela parada**: o Codex não devolve "sem janela" como o Claude. A janela parada
+  aparece com uso em 0% e o tempo até o reset igual à duração inteira (ela "anda"
+  com o relógio enquanto ninguém a abre), ou com o reset já vencido. É isso que o app
+  procura. A duração vem da própria API, então uma janela de outro tamanho que não 5h
+  também funciona.
+- **Sem janela de 5h, fica dormente**: se a OpenAI suspender o limite de 5h de novo,
+  ou se o plano não tiver esse limite, nada é enviado, e a conta mostra o motivo.
+  Quando a janela volta, o recurso volta sozinho.
+- **Cota esgotada**: com a cota semanal (ou outro limite) esgotada, nada é enviado — um
+  "Oi" ali não abriria nada.
+- **Contra cobrança por API**: só vai login ChatGPT (assinatura). Uma conta com chave
+  de API gravada é recusada, e `OPENAI_API_KEY`, `CODEX_API_KEY` e `OPENAI_BASE_URL`
+  são retiradas do processo do CLI.
+- **Custo mínimo**: o disparo usa o modelo mais leve do Codex (`gpt-6-luna`), o
+  menor esforço de raciocínio, uma instrução de sistema de uma linha no lugar do
+  prompt do agente e nenhum extra (skills, plugins, ferramentas, busca na web,
+  instruções de ambiente e de permissões). Medido no CLI: ~2,7 mil tokens de entrada
+  e 5 de saída, contra ~15 mil e 13 no `codex exec` padrão. O `gpt-6-luna` conta na
+  janela de 5h; os modelos "mini" não (são cobrados de outra cota e não abririam a
+  janela). Roda numa pasta vazia, com o sandbox só de leitura e **sem** a configuração do seu
+  `~/.codex`.
+- **O login da conta continua só com o app**: o app renova o token da conta antes do
+  disparo, e a cópia entregue ao CLI vai **sem** o token de renovação. Assim o CLI
+  usa o login, mas não tem como renová-lo por conta própria — o que invalidaria o
+  token guardado no app e faria a coleta perder o login.
+- **Esperas**: 15 min depois de um disparo que deu certo (a API demora a mostrar a
+  janela nova), 5 min depois de uma falha e 30 min depois de uma recusa por limite de
+  uso. O teto de cada chamada é de 2 min. Com várias contas, um disparo por vez.
+  Desligar o provedor, o interruptor geral ou uma conta cancela os envios automáticos
+  dela que ainda estejam aguardando na fila; um envio já iniciado segue até terminar.
+- **Enviar teste**: manda o "Oi" na hora, sem olhar a janela (mas ainda com a proteção
+  contra cobrança). Serve para ver se o CLI funciona; se houver uma janela correndo,
+  ele só gasta um pouco dela.
+- A linha de cada conta mostra o envio em andamento, o motivo de estar parada ou o
+  resultado da última tentativa (o detalhe da falha também vai para o log).
+
+Requisitos:
+
+- **Codex CLI** instalado (`npm i -g @openai/codex`). O login dele **não** é usado. O app
+  procura o executável nos locais padrão (inclusive o npm global do `fnm`) e, se não
+  achar, no `PATH`; para instalações fora desses caminhos, informe o caminho em
+  `sessaoAutoCodex.caminhoCli` no `contas.json`.
 
 ## Barra de tarefas (Windows)
 
@@ -741,6 +804,11 @@ Codex:
   (ou use uma janela anônima) e tente de novo
 - O login pelo navegador abre a porta local `1455` para receber o retorno do OAuth
   (mesma porta usada pelo Codex CLI); deixe-a livre durante a conexão
+- A **abertura automática de sessão** depende do Codex CLI instalado (o login dele não
+  é usado); sem ele, a falha aparece na conta, na aba Codex das Configurações
+- Uma versão anterior do app que grave o `contas.json` (ex.: ao mudar um apelido)
+  descarta os ajustes da abertura automática, que ela não conhece: o recurso volta
+  desligado, que é o padrão seguro
 
 ## Estrutura do projeto
 
@@ -787,7 +855,9 @@ src-tauri/
     codex_dashboard.rs # historico diario de uso do Codex (API wham, get_codex_stats)
     contas.rs          # varias contas por provedor: arquivos (principal no legado, extras em contas/),
                        # preferencias em contas.json, principal/remocao e dedupe por identidade
-    codex_auth.rs      # login do Codex pelo navegador (OAuth+PKCE) e refresh dos tokens
+    codex_auth.rs      # login do Codex pelo navegador (OAuth+PKCE), refresh dos tokens e
+                       # copia do login usada pela sessao automatica
+    sessao_auto_codex.rs # abertura automatica da janela de 5h do Codex (por conta, via Codex CLI)
     claude_auth.rs     # login do Claude pelo navegador (captura o sessionKey do webview) e org
     http_server.rs     # servidor HTTP opcional: serve os dashboards no navegador com PIN (somente leitura)
     taskbar_widget.rs  # widget da barra de tarefas (somente Windows)
